@@ -1,0 +1,405 @@
+package commands
+
+import (
+	"go/format"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// defaultIdentity returns the template's default identity values.
+func defaultIdentity() identityVals {
+	return identityVals{
+		AppName:    "go-cli",
+		ConfigName: "go-cli-config",
+		EnvPrefix:  "GOCLI",
+		DataDir:    ".go-cli",
+		BinTrio:    "cli",
+	}
+}
+
+// mustPlan is a test helper for the (plan, error) buildPlan signature. It fails
+// the test on a formatting error, which the fixture inputs never trigger.
+func mustPlan(t *testing.T, root string, cur, next identityVals) plan {
+	t.Helper()
+	p, err := buildPlan(root, cur, next)
+	if err != nil {
+		t.Fatalf("buildPlan: %v", err)
+	}
+	return p
+}
+
+// mustIdentityContent is a test helper for the ([]byte, error) generator.
+func mustIdentityContent(t *testing.T, v identityVals) []byte {
+	t.Helper()
+	b, err := buildIdentityContent(v)
+	if err != nil {
+		t.Fatalf("buildIdentityContent: %v", err)
+	}
+	return b
+}
+
+func TestValidateIdentity_RejectsInvalid(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(v *identityVals)
+	}{
+		{"empty app name", func(v *identityVals) { v.AppName = "" }},
+		{"app name with space", func(v *identityVals) { v.AppName = "my app" }},
+		{"app name with slash", func(v *identityVals) { v.AppName = "my/app" }},
+		{"empty env prefix", func(v *identityVals) { v.EnvPrefix = "" }},
+		{"env prefix leading digit", func(v *identityVals) { v.EnvPrefix = "9GOCLI" }},
+		{"env prefix with space", func(v *identityVals) { v.EnvPrefix = "GO CLI" }},
+		{"env prefix with dash", func(v *identityVals) { v.EnvPrefix = "GO-CLI" }},
+		{"empty data dir", func(v *identityVals) { v.DataDir = "" }},
+		{"data dir with slash", func(v *identityVals) { v.DataDir = ".foo/bar" }},
+		{"data dir with space", func(v *identityVals) { v.DataDir = ".foo bar" }},
+		{"empty bin trio", func(v *identityVals) { v.BinTrio = "" }},
+		{"bin trio with hyphen", func(v *identityVals) { v.BinTrio = "my-app" }},
+		{"bin trio leading digit", func(v *identityVals) { v.BinTrio = "1app" }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := defaultIdentity()
+			tc.mutate(&v)
+			if err := validateIdentity(v); err == nil {
+				t.Fatalf("expected validation error for %s, got nil", tc.name)
+			}
+		})
+	}
+}
+
+func TestValidateIdentity_AcceptsValid(t *testing.T) {
+	v := defaultIdentity()
+	if err := validateIdentity(v); err != nil {
+		t.Fatalf("expected default identity to validate, got: %v", err)
+	}
+
+	if err := validateIdentity(newIdentityVals("myapp", "myapp", ".myapp", "myapp")); err != nil {
+		t.Fatalf("expected valid re-identity to validate, got: %v", err)
+	}
+}
+
+func TestNewIdentityVals_DerivesConfigNameAndUppercasesEnv(t *testing.T) {
+	v := newIdentityVals("myapp", "myapp", ".myapp", "myapp")
+	if v.ConfigName != "myapp-config" {
+		t.Errorf("ConfigName = %q, want %q", v.ConfigName, "myapp-config")
+	}
+	if v.EnvPrefix != "MYAPP" {
+		t.Errorf("EnvPrefix = %q, want %q", v.EnvPrefix, "MYAPP")
+	}
+}
+
+func TestBuildPlan_RenamesAndRewritesConsistently(t *testing.T) {
+	root := t.TempDir()
+	cur := defaultIdentity()
+	next := newIdentityVals("myapp", "myapp", ".myapp", "myapp")
+
+	p := mustPlan(t, root, cur, next)
+
+	// Categorize changes.
+	var renames, writes, rewrites []change
+	for _, c := range p.Changes {
+		switch c.Kind {
+		case kindRename:
+			renames = append(renames, c)
+		case kindWrite:
+			writes = append(writes, c)
+		case kindRewrite:
+			rewrites = append(rewrites, c)
+		}
+	}
+
+	// 3 dir renames.
+	if len(renames) != 3 {
+		t.Fatalf("expected 3 renames, got %d: %+v", len(renames), renames)
+	}
+	byFrom := map[string]string{}
+	for _, c := range renames {
+		byFrom[c.From] = c.To
+	}
+	if got := byFrom[filepath.Join(root, "cmd", "cli")]; got != filepath.Join(root, "cmd", "myapp") {
+		t.Errorf("cli rename: got %q", got)
+	}
+	if got := byFrom[filepath.Join(root, "cmd", "cli-config")]; got != filepath.Join(root, "cmd", "myapp-config") {
+		t.Errorf("cli-config rename: got %q", got)
+	}
+	if got := byFrom[filepath.Join(root, "cmd", "cli-migration")]; got != filepath.Join(root, "cmd", "myapp-migration") {
+		t.Errorf("cli-migration rename: got %q", got)
+	}
+
+	// identity.go + .gitignore writes.
+	var identityWrite, gitignoreWrite *change
+	for i := range writes {
+		if writes[i].Path == filepath.Join(root, "internal", "identity", "identity.go") {
+			identityWrite = &writes[i]
+		}
+		if writes[i].Path == filepath.Join(root, ".gitignore") {
+			gitignoreWrite = &writes[i]
+		}
+	}
+	if identityWrite == nil {
+		t.Fatal("expected identity.go write")
+	}
+	content := string(identityWrite.Content)
+	for _, want := range []string{`AppName    = "myapp"`, `ConfigName = "myapp-config"`, `EnvPrefix  = "MYAPP"`, `DataDir    = ".myapp"`, `BinTrio    = "myapp"`} {
+		if !strings.Contains(content, want) {
+			t.Errorf("identity content missing %q", want)
+		}
+	}
+	if !strings.Contains(content, "GENERATED by the `setup` command") {
+		t.Error("identity content missing GENERATED comment block")
+	}
+	if !strings.Contains(content, "package identity") {
+		t.Error("identity content missing package clause")
+	}
+
+	if gitignoreWrite == nil {
+		t.Fatal("expected .gitignore write")
+	}
+	gi := string(gitignoreWrite.Content)
+	if !strings.Contains(gi, "/.myapp\n") {
+		t.Errorf(".gitignore missing data dir line; got:\n%s", gi)
+	}
+	if !strings.Contains(gi, "/myapp-config.json\n") {
+		t.Errorf(".gitignore missing config name line; got:\n%s", gi)
+	}
+	if !strings.Contains(gi, ".env\n") || !strings.Contains(gi, "*.log\n") {
+		t.Errorf(".gitignore lost .env/*.log lines; got:\n%s", gi)
+	}
+
+	// Use rewrites + panic tag rewrites: 6 rewrite changes.
+	if len(rewrites) != 6 {
+		t.Fatalf("expected 6 rewrites (3 Use + 3 panic), got %d: %+v", len(rewrites), rewrites)
+	}
+	type pair struct{ old, new string }
+	byPath := map[string]pair{}
+	for _, c := range rewrites {
+		byPath[c.Path] = pair{c.Old, c.New}
+	}
+	assertRewrite := func(path, old, new string) {
+		p, ok := byPath[path]
+		if !ok {
+			t.Errorf("missing rewrite for %s", path)
+			return
+		}
+		if p.old != old || p.new != new {
+			t.Errorf("rewrite %s: got old=%q new=%q, want old=%q new=%q", path, p.old, p.new, old, new)
+		}
+	}
+	assertRewrite(filepath.Join(root, "internal", "commands", "root.go"), "cli", "myapp")
+	assertRewrite(filepath.Join(root, "internal", "config", "commands", "root.go"), "cli-config", "myapp-config")
+	assertRewrite(filepath.Join(root, "internal", "database", "commands", "root.go"), "cli-migrations", "myapp-migrations")
+	assertRewrite(filepath.Join(root, "cmd", "myapp", "main.go"), "cli-main", "myapp-main")
+	assertRewrite(filepath.Join(root, "cmd", "myapp-config", "main.go"), "cli-config-main", "myapp-config-main")
+	assertRewrite(filepath.Join(root, "cmd", "myapp-migration", "main.go"), "cli-migration-main", "myapp-migration-main")
+}
+
+func TestBuildPlan_Idempotent(t *testing.T) {
+	root := t.TempDir()
+	cur := defaultIdentity()
+
+	// Same values -> empty plan.
+	if p := mustPlan(t, root, cur, cur); !p.empty() {
+		t.Fatalf("expected empty plan for identical identity, got %d changes", len(p.Changes))
+	}
+
+	// Same values via newIdentityVals (normalization) -> empty plan.
+	next := newIdentityVals(cur.AppName, cur.EnvPrefix, cur.DataDir, cur.BinTrio)
+	if p := mustPlan(t, root, cur, next); !p.empty() {
+		t.Fatalf("expected empty plan for normalized-identical identity, got %d changes", len(p.Changes))
+	}
+}
+
+func TestBuildPlan_OnlyConfigChangeSkipsRenames(t *testing.T) {
+	root := t.TempDir()
+	cur := defaultIdentity()
+	// Change only DataDir/AppName -> ConfigName differs but BinTrio stays "cli".
+	next := defaultIdentity()
+	next.AppName = "foo"
+	next.ConfigName = "foo-config"
+
+	p := mustPlan(t, root, cur, next)
+	if p.empty() {
+		t.Fatal("expected non-empty plan for data-dir/config-only change")
+	}
+	for _, c := range p.Changes {
+		if c.Kind == kindRename {
+			t.Fatalf("did not expect renames when BinTrio unchanged, got: %+v", c)
+		}
+		if c.Kind == kindRewrite {
+			t.Fatalf("did not expect rewrites when BinTrio unchanged, got: %+v", c)
+		}
+	}
+}
+
+// applyAgainstFixture builds a minimal temp workspace mirroring the parts of the
+// tree the applier touches, applies a plan for real, and confirms the result.
+func applyAgainstFixture(t *testing.T) {
+	root := t.TempDir()
+
+	// Build the skeleton the applier references.
+	mkfile := func(rel string, content string) {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mkfile("internal/identity/identity.go", string(mustIdentityContent(t, defaultIdentity())))
+	mkfile("internal/commands/root.go", "package commands\nvar RootCmd = &cobra.Command{Use: \"cli\", ...}\n")
+	mkfile("internal/config/commands/root.go", "package commands\nvar RootConfigCmd = &cobra.Command{Use: \"cli-config\", ...}\n")
+	mkfile("internal/database/commands/root.go", "package commands\nvar RootConfigCmd = &cobra.Command{Use: \"cli-migrations\", ...}\n")
+	mkfile("cmd/cli/main.go", "package main\nfunc main(){ var exitCode uint8; defer func(){ if exitCode != 0 { os.Exit(int(exitCode)) } }(); defer logging.RecoverPanic(\"cli-main\", &exitCode, nil); exitCode = commands.ExecuteCmd(commands.RootCmd) }\n")
+	mkfile("cmd/cli-config/main.go", "package main\nfunc main(){ var exitCode uint8; defer func(){ if exitCode != 0 { os.Exit(int(exitCode)) } }(); defer logging.RecoverPanic(\"cli-config-main\", &exitCode, nil); exitCode = commands.ExecuteCmd(commands.ConfigCmd) }\n")
+	mkfile("cmd/cli-migration/main.go", "package main\nfunc main(){ var exitCode uint8; defer func(){ if exitCode != 0 { os.Exit(int(exitCode)) } }(); defer logging.RecoverPanic(\"cli-migration-main\", &exitCode, nil); exitCode = commands.ExecuteCmd(commands.DatabaseCmd) }\n")
+	mkfile(".gitignore", ".env\n*.log\n/.go-cli\n/go-cli-config.json\n")
+
+	cur := defaultIdentity()
+	next := newIdentityVals("myapp", "myapp", ".myapp", "myapp")
+	p := mustPlan(t, root, cur, next)
+
+	if err := apply(p, false); err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+
+	// Identity regenerated.
+	data, _ := os.ReadFile(filepath.Join(root, "internal", "identity", "identity.go"))
+	if !strings.Contains(string(data), `BinTrio    = "myapp"`) {
+		t.Errorf("identity not regenerated: %s", data)
+	}
+
+	// Directories renamed, old dirs gone.
+	for _, oldRel := range []string{"cmd/cli", "cmd/cli-config", "cmd/cli-migration"} {
+		if _, err := os.Stat(filepath.Join(root, oldRel)); !os.IsNotExist(err) {
+			t.Errorf("expected %s to be removed, stat err=%v", oldRel, err)
+		}
+	}
+	for _, newRel := range []string{"cmd/myapp", "cmd/myapp-config", "cmd/myapp-migration"} {
+		if _, err := os.Stat(filepath.Join(root, newRel)); err != nil {
+			t.Errorf("expected %s to exist, err=%v", newRel, err)
+		}
+	}
+
+	// Use strings rewritten.
+	assertFileContains := func(rel, want string) {
+		b, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		if !strings.Contains(string(b), want) {
+			t.Errorf("%s: expected %q, got %q", rel, want, string(b))
+		}
+	}
+	assertFileContains("internal/commands/root.go", `Use: "myapp"`)
+	assertFileContains("internal/config/commands/root.go", `Use: "myapp-config"`)
+	assertFileContains("internal/database/commands/root.go", `Use: "myapp-migrations"`)
+
+	// Panic tags rewritten.
+	assertFileContains("cmd/myapp/main.go", `RecoverPanic("myapp-main"`)
+	assertFileContains("cmd/myapp-config/main.go", `RecoverPanic("myapp-config-main"`)
+	assertFileContains("cmd/myapp-migration/main.go", `RecoverPanic("myapp-migration-main"`)
+
+	// .gitignore rewritten.
+	b, _ := os.ReadFile(filepath.Join(root, ".gitignore"))
+	gi := string(b)
+	if !strings.Contains(gi, "/.myapp\n") || !strings.Contains(gi, "/myapp-config.json\n") {
+		t.Errorf(".gitignore not rewritten: %s", gi)
+	}
+	if !strings.Contains(gi, ".env\n") || !strings.Contains(gi, "*.log\n") {
+		t.Errorf(".gitignore dropped static lines: %s", gi)
+	}
+}
+
+func TestApply_AppliesFullPlan(t *testing.T) {
+	applyAgainstFixture(t)
+}
+
+func TestApply_DryRunMutatesNothing(t *testing.T) {
+	root := t.TempDir()
+
+	mkfile := func(rel, content string) {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkfile("internal/identity/identity.go", string(mustIdentityContent(t, defaultIdentity())))
+	mkfile("internal/commands/root.go", "package commands\nvar RootCmd = &cobra.Command{Use: \"cli\", ...}\n")
+	mkfile("internal/config/commands/root.go", "package commands\nvar RootConfigCmd = &cobra.Command{Use: \"cli-config\", ...}\n")
+	mkfile("internal/database/commands/root.go", "package commands\nvar RootConfigCmd = &cobra.Command{Use: \"cli-migrations\", ...}\n")
+	mkfile("cmd/cli/main.go", "package main\nfunc main(){ var exitCode uint8; defer func(){ if exitCode != 0 { os.Exit(int(exitCode)) } }(); defer logging.RecoverPanic(\"cli-main\", &exitCode, nil); exitCode = commands.ExecuteCmd(commands.RootCmd) }\n")
+	mkfile("cmd/cli-config/main.go", "package main\nfunc main(){ var exitCode uint8; defer func(){ if exitCode != 0 { os.Exit(int(exitCode)) } }(); defer logging.RecoverPanic(\"cli-config-main\", &exitCode, nil); exitCode = commands.ExecuteCmd(commands.ConfigCmd) }\n")
+	mkfile("cmd/cli-migration/main.go", "package main\nfunc main(){ var exitCode uint8; defer func(){ if exitCode != 0 { os.Exit(int(exitCode)) } }(); defer logging.RecoverPanic(\"cli-migration-main\", &exitCode, nil); exitCode = commands.ExecuteCmd(commands.DatabaseCmd) }\n")
+	mkfile(".gitignore", ".env\n*.log\n/.go-cli\n/go-cli-config.json\n")
+
+	cur := defaultIdentity()
+	next := newIdentityVals("myapp", "myapp", ".myapp", "myapp")
+	p := mustPlan(t, root, cur, next)
+
+	if err := apply(p, true); err != nil {
+		t.Fatalf("dry-run apply failed: %v", err)
+	}
+
+	// Nothing mutated: old dirs still present, identity unchanged.
+	for _, rel := range []string{"cmd/cli", "cmd/cli-config", "cmd/cli-migration"} {
+		if _, err := os.Stat(filepath.Join(root, rel)); err != nil {
+			t.Errorf("dry-run should not have renamed; %s stat err=%v", rel, err)
+		}
+	}
+	b, _ := os.ReadFile(filepath.Join(root, "internal", "identity", "identity.go"))
+	if strings.Contains(string(b), `"myapp"`) {
+		t.Errorf("dry-run mutated identity.go: %s", b)
+	}
+	// New dirs must not exist.
+	for _, rel := range []string{"cmd/myapp", "cmd/myapp-config", "cmd/myapp-migration"} {
+		if _, err := os.Stat(filepath.Join(root, rel)); !os.IsNotExist(err) {
+			t.Errorf("dry-run should not create dirs; %s stat err=%v", rel, err)
+		}
+	}
+}
+
+func TestApply_SameValuesNoOp(t *testing.T) {
+	// An empty plan applies cleanly and leaves nothing behind.
+	root := t.TempDir()
+	cur := defaultIdentity()
+	p := mustPlan(t, root, cur, cur)
+	if err := apply(p, false); err != nil {
+		t.Fatalf("empty plan apply failed: %v", err)
+	}
+}
+
+// TestBuildIdentityContent_IsGofmtClean guards the invariant that the generated
+// identity source is properly formatted for arbitrary identity values, not just
+// the template defaults. Regression: per-value comment alignment used to be
+// hardcoded, so any rename produced a file that failed gofmt.
+func TestBuildIdentityContent_IsGofmtClean(t *testing.T) {
+	cases := []identityVals{
+		defaultIdentity(),
+		newIdentityVals("myapp", "myapp", ".myapp", "myapp"),
+		newIdentityVals("a", "a", ".a", "a"),
+		newIdentityVals("a-very-long-application-name", "VERY_LONG_PREFIX", ".long-data-dir", "verylongbinary"),
+	}
+
+	for _, v := range cases {
+		src := mustIdentityContent(t, v)
+
+		// format.Source is idempotent: formatting the generator's (already
+		// formatted) output must be a no-op.
+		formatted, err := format.Source(src)
+		if err != nil {
+			t.Fatalf("generated source for %q does not parse: %v\n%s", v.AppName, err, src)
+		}
+		if string(formatted) != string(src) {
+			t.Errorf("generated identity for %q is not gofmt-clean.\n--- got ---\n%s\n--- want ---\n%s", v.AppName, src, formatted)
+		}
+	}
+}
