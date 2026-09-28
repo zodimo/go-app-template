@@ -189,8 +189,8 @@ gonew github.com/zodimo/go-app-template@<version> your.domain/myapp
 **Layer 2. identity with `setup`:**
 
 ```sh
-cd your.domain/myapp
-myapp setup
+cd myapp
+go run ./cmd/cli setup
 ```
 
 The `setup` command (a cobra wizard) completes the clone by re-identifying the project. It collects an AppName, environment prefix, data directory, and binary-trio prefix, then:
