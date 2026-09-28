@@ -143,14 +143,15 @@ const (
 //   - write:   Path <- Content (full-file regeneration: identity.go, .gitignore)
 //   - rewrite: Path: replace the literal Old with New (Use lines, panic tags)
 type change struct {
-	Kind    changeKind
-	From    string // rename source
-	To      string // rename destination
-	Path    string // write/rewrite target
-	Content []byte // write content
-	Old     string // rewrite literal to find
-	New     string // rewrite literal to substitute
-	Desc    string // human-readable description for --dry-run
+	Kind          changeKind
+	From          string // rename source
+	To            string // rename destination
+	Path          string // write/rewrite target
+	Content       []byte // write content
+	Old           string // rewrite literal to find
+	New           string // rewrite literal to substitute
+	Desc          string // human-readable description for --dry-run
+	SkipIfMissing bool   // rewrite: skip (no error) when the file or literal is absent
 }
 
 // plan is the ordered set of changes.
@@ -175,6 +176,7 @@ type identityPaths struct {
 	ConfigMain    string
 	MigrationMain string
 	Gitignore     string
+	Makefile      string
 }
 
 func findPaths(root string, v identityVals) identityPaths {
@@ -190,6 +192,7 @@ func findPaths(root string, v identityVals) identityPaths {
 		ConfigMain:    filepath.Join(root, "cmd", v.BinTrio+"-config", "main.go"),
 		MigrationMain: filepath.Join(root, "cmd", v.BinTrio+"-migration", "main.go"),
 		Gitignore:     filepath.Join(root, ".gitignore"),
+		Makefile:      filepath.Join(root, "Makefile"),
 	}
 }
 
@@ -315,6 +318,16 @@ func buildPlan(root string, cur, next identityVals) (plan, error) {
 			Old: cur.BinTrio + "-migration-main", New: next.BinTrio + "-migration-main",
 			Desc: fmt.Sprintf("rewrite panic tag %q → %q in %s", cur.BinTrio+"-migration-main", next.BinTrio+"-migration-main", nextPaths.MigrationMain),
 		})
+
+		// The root Makefile exposes a single setup-managed line that drives the
+		// binary trio. SkipIfMissing keeps a deleted or reformatted Makefile from
+		// failing setup (buildPlan stays pure; apply performs the I/O).
+		p.Changes = append(p.Changes, change{
+			Kind: kindRewrite, Path: nextPaths.Makefile,
+			Old: "BIN_TRIO ?= " + cur.BinTrio, New: "BIN_TRIO ?= " + next.BinTrio,
+			Desc:          fmt.Sprintf("rewrite BIN_TRIO in %s", nextPaths.Makefile),
+			SkipIfMissing: true,
+		})
 	}
 
 	// 5. Rewrite .gitignore identity lines (full-file regenerate; deterministic
@@ -354,6 +367,18 @@ func apply(p plan, dryRun bool) error {
 				return fmt.Errorf("write %s: %w", c.Path, err)
 			}
 		case kindRewrite:
+			if c.SkipIfMissing {
+				data, err := os.ReadFile(c.Path)
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				if err != nil {
+					return fmt.Errorf("rewrite %s: %w", c.Path, err)
+				}
+				if !strings.Contains(string(data), c.Old) {
+					continue
+				}
+			}
 			if err := rewriteLiteral(c.Path, c.Old, c.New); err != nil {
 				return fmt.Errorf("rewrite %s: %w", c.Path, err)
 			}

@@ -170,9 +170,9 @@ func TestBuildPlan_RenamesAndRewritesConsistently(t *testing.T) {
 		t.Errorf(".gitignore lost .env/*.log lines; got:\n%s", gi)
 	}
 
-	// Use rewrites + panic tag rewrites: 6 rewrite changes.
-	if len(rewrites) != 6 {
-		t.Fatalf("expected 6 rewrites (3 Use + 3 panic), got %d: %+v", len(rewrites), rewrites)
+	// Use rewrites + panic tag rewrites + Makefile: 7 rewrite changes.
+	if len(rewrites) != 7 {
+		t.Fatalf("expected 7 rewrites (3 Use + 3 panic + 1 Makefile), got %d: %+v", len(rewrites), rewrites)
 	}
 	type pair struct{ old, new string }
 	byPath := map[string]pair{}
@@ -195,6 +195,21 @@ func TestBuildPlan_RenamesAndRewritesConsistently(t *testing.T) {
 	assertRewrite(filepath.Join(root, "cmd", "myapp", "main.go"), "cli-main", "myapp-main")
 	assertRewrite(filepath.Join(root, "cmd", "myapp-config", "main.go"), "cli-config-main", "myapp-config-main")
 	assertRewrite(filepath.Join(root, "cmd", "myapp-migration", "main.go"), "cli-migration-main", "myapp-migration-main")
+
+	assertRewrite(filepath.Join(root, "Makefile"), "BIN_TRIO ?= cli", "BIN_TRIO ?= myapp")
+
+	var makefileRewrite *change
+	for i := range rewrites {
+		if rewrites[i].Path == filepath.Join(root, "Makefile") {
+			makefileRewrite = &rewrites[i]
+		}
+	}
+	if makefileRewrite == nil {
+		t.Fatal("expected a Makefile rewrite")
+	}
+	if !makefileRewrite.SkipIfMissing {
+		t.Error("Makefile rewrite must set SkipIfMissing")
+	}
 }
 
 func TestBuildPlan_Idempotent(t *testing.T) {
@@ -401,5 +416,197 @@ func TestBuildIdentityContent_IsGofmtClean(t *testing.T) {
 		if string(formatted) != string(src) {
 			t.Errorf("generated identity for %q is not gofmt-clean.\n--- got ---\n%s\n--- want ---\n%s", v.AppName, src, formatted)
 		}
+	}
+}
+
+// writeFixtureFile writes content to rel under root, creating parent dirs.
+func writeFixtureFile(t *testing.T, root, rel, content string) {
+	t.Helper()
+	p := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// buildFixtureSkeleton writes the minimal workspace the applier touches and
+// returns its root. It mirrors the fixture in applyAgainstFixture.
+func buildFixtureSkeleton(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	mk := func(rel, content string) {
+		t.Helper()
+		writeFixtureFile(t, root, rel, content)
+	}
+	mk("internal/identity/identity.go", string(mustIdentityContent(t, defaultIdentity())))
+	mk("internal/commands/root.go", "package commands\nvar RootCmd = &cobra.Command{Use: \"cli\", ...}\n")
+	mk("internal/config/commands/root.go", "package commands\nvar RootConfigCmd = &cobra.Command{Use: \"cli-config\", ...}\n")
+	mk("internal/database/commands/root.go", "package commands\nvar RootConfigCmd = &cobra.Command{Use: \"cli-migrations\", ...}\n")
+	mk("cmd/cli/main.go", "package main\nfunc main(){ var exitCode uint8; defer func(){ if exitCode != 0 { os.Exit(int(exitCode)) } }(); defer logging.RecoverPanic(\"cli-main\", &exitCode, nil); exitCode = commands.ExecuteCmd(commands.RootCmd) }\n")
+	mk("cmd/cli-config/main.go", "package main\nfunc main(){ var exitCode uint8; defer func(){ if exitCode != 0 { os.Exit(int(exitCode)) } }(); defer logging.RecoverPanic(\"cli-config-main\", &exitCode, nil); exitCode = commands.ExecuteCmd(commands.ConfigCmd) }\n")
+	mk("cmd/cli-migration/main.go", "package main\nfunc main(){ var exitCode uint8; defer func(){ if exitCode != 0 { os.Exit(int(exitCode)) } }(); defer logging.RecoverPanic(\"cli-migration-main\", &exitCode, nil); exitCode = commands.ExecuteCmd(commands.DatabaseCmd) }\n")
+	mk(".gitignore", ".env\n*.log\n/.go-cli\n/go-cli-config.json\n")
+	return root
+}
+
+// fixtureMakefile holds the single setup-managed BIN_TRIO line plus unrelated
+// cli-config / cli-migration references that must survive untouched.
+const fixtureMakefile = `BIN_TRIO ?= cli
+BINARY           = $(BIN_TRIO)
+CONFIG_BINARY    = $(BIN_TRIO)-config
+MIGRATION_BINARY = $(BIN_TRIO)-migration
+
+config-init:
+	go run ./cmd/cli-config init
+
+migrate:
+	go run ./cmd/cli-migration migrate up
+`
+
+// makefileChangeFrom returns the planned Makefile rewrite, failing if absent.
+func makefileChangeFrom(t *testing.T, root string, p plan) change {
+	t.Helper()
+	want := filepath.Join(root, "Makefile")
+	for _, c := range p.Changes {
+		if c.Kind == kindRewrite && c.Path == want {
+			return c
+		}
+	}
+	t.Fatalf("no Makefile rewrite in plan: %+v", p.Changes)
+	return change{}
+}
+
+// TestApply_RewritesOnlyBinTrioLineInMakefile covers task 4.1: a real Makefile
+// with BIN_TRIO plus cli-config / cli-migration references is rewritten on the
+// BIN_TRIO line only.
+func TestApply_RewritesOnlyBinTrioLineInMakefile(t *testing.T) {
+	root := buildFixtureSkeleton(t)
+	writeFixtureFile(t, root, "Makefile", fixtureMakefile)
+
+	cur := defaultIdentity()
+	next := newIdentityVals("myapp", "myapp", ".myapp", "myapp")
+	p := mustPlan(t, root, cur, next)
+
+	if err := apply(p, false); err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+
+	b, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	if !strings.Contains(got, "BIN_TRIO ?= myapp") {
+		t.Errorf("Makefile missing rewritten BIN_TRIO line:\n%s", got)
+	}
+	if strings.Contains(got, "BIN_TRIO ?= cli") {
+		t.Errorf("Makefile still contains the old BIN_TRIO line:\n%s", got)
+	}
+	for _, want := range []string{"./cmd/cli-config", "./cmd/cli-migration"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Makefile lost unrelated reference %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestBuildPlan_NoMakefileChangeWhenBinTrioUnchanged covers task 4.2: identical
+// identity yields an empty plan and no Makefile change.
+func TestBuildPlan_NoMakefileChangeWhenBinTrioUnchanged(t *testing.T) {
+	root := t.TempDir()
+	cur := defaultIdentity()
+
+	p := mustPlan(t, root, cur, cur)
+	if !p.empty() {
+		t.Fatalf("expected empty plan for identical identity, got %d changes", len(p.Changes))
+	}
+	for _, c := range p.Changes {
+		if c.Path == filepath.Join(root, "Makefile") {
+			t.Fatalf("expected no Makefile change, got %+v", c)
+		}
+	}
+}
+
+// TestApply_DryRunLeavesMakefileUnchanged covers task 4.3: --dry-run reports
+// the Makefile rewrite and mutates nothing.
+func TestApply_DryRunLeavesMakefileUnchanged(t *testing.T) {
+	root := buildFixtureSkeleton(t)
+	writeFixtureFile(t, root, "Makefile", fixtureMakefile)
+
+	before, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cur := defaultIdentity()
+	next := newIdentityVals("myapp", "myapp", ".myapp", "myapp")
+	p := mustPlan(t, root, cur, next)
+
+	mk := makefileChangeFrom(t, root, p)
+	if !strings.Contains(mk.Desc, "BIN_TRIO") {
+		t.Errorf("Makefile change desc = %q, want it to mention BIN_TRIO", mk.Desc)
+	}
+
+	out := captureStderr(t, func() {
+		if err := apply(p, true); err != nil {
+			t.Fatalf("dry-run apply failed: %v", err)
+		}
+	})
+	if !strings.Contains(out, "BIN_TRIO") {
+		t.Errorf("dry-run did not report the Makefile rewrite; stderr:\n%s", out)
+	}
+
+	after, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("dry-run mutated the Makefile:\n--- before ---\n%s\n--- after ---\n%s", before, after)
+	}
+}
+
+// TestApply_SkipsMissingMakefile covers task 4.4: a deleted Makefile is skipped
+// without error and without being recreated.
+func TestApply_SkipsMissingMakefile(t *testing.T) {
+	root := buildFixtureSkeleton(t) // deliberately no Makefile
+
+	cur := defaultIdentity()
+	next := newIdentityVals("myapp", "myapp", ".myapp", "myapp")
+	p := mustPlan(t, root, cur, next)
+
+	mk := makefileChangeFrom(t, root, p)
+	if !mk.SkipIfMissing {
+		t.Error("Makefile rewrite must set SkipIfMissing")
+	}
+
+	if err := apply(p, false); err != nil {
+		t.Fatalf("apply with missing Makefile failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Makefile")); !os.IsNotExist(err) {
+		t.Errorf("missing Makefile should stay absent, stat err=%v", err)
+	}
+}
+
+// TestApply_SkipsMakefileWithMissingAnchor verifies the second SkipIfMissing
+// condition: a reformatted Makefile without the BIN_TRIO anchor is skipped
+// rather than failing setup.
+func TestApply_SkipsMakefileWithMissingAnchor(t *testing.T) {
+	root := buildFixtureSkeleton(t)
+	writeFixtureFile(t, root, "Makefile", "BINARY = cli\n")
+
+	cur := defaultIdentity()
+	next := newIdentityVals("myapp", "myapp", ".myapp", "myapp")
+	p := mustPlan(t, root, cur, next)
+
+	if err := apply(p, false); err != nil {
+		t.Fatalf("apply with anchorless Makefile failed: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "BINARY = cli\n" {
+		t.Errorf("anchorless Makefile was mutated: %q", b)
 	}
 }

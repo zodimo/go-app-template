@@ -197,7 +197,7 @@ The `setup` command (a cobra wizard) completes the clone by re-identifying the p
 
 - regenerates `internal/identity/identity.go`,
 - renames `cmd/cli` → `cmd/myapp`, `cmd/cli-config` → `cmd/myapp-config`, `cmd/cli-migration` → `cmd/myapp-migration`,
-- rewrites the cobra `use:` strings, panic tags, and related identity-dependent files.
+- rewrites the cobra `use:` strings, panic tags, the Makefile's `BIN_TRIO` line, and related identity-dependent files.
 
 **Then build and initialize:**
 
@@ -207,6 +207,8 @@ myapp-config init   # generates your config file (never shipped)
 ```
 
 Because `gonew` stops at Go code and `setup` stops at identity, the two layers are complementary: `gonew` gives you correct module plumbing, and `setup` gives you an app whose name, config file, environment prefix, data directory, log file, and database name all consistently derive from your new identity.
+
+Neither layer needs a manual Makefile edit. After `gonew` rewrites `go.mod`, the Makefile derives the module path from `go list -m` at make time, so the linker `-X` flags never point at a stale module. After `setup` renames the binary trio, it rewrites the Makefile's single `BIN_TRIO ?= ...` line, so `make build` keeps targeting the renamed `cmd/` directories.
 
 See `CONTRIBUTING.md` for the same flow restated for contributors, plus the identity single-source contract.
 

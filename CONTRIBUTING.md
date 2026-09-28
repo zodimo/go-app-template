@@ -40,6 +40,8 @@ myapp-config init   # generates the config file; never committed
 
 `internal/identity/identity.go` is the **single source of app identity**. It holds `AppName`, `ConfigName`, `EnvPrefix`, `DataDir`, and `BinTrio`. This file is **generated** by the `setup` command. Do not edit it by hand; re-run `setup` to change identity.
 
+`setup` owns the binary-trio prefix wherever it appears in the template. During re-identification it rewrites the Makefile's `BIN_TRIO ?= <value>` line, alongside `internal/identity/identity.go`, the `cmd/` directories, the cobra `use:` strings, the panic tags, and `.gitignore`. Do not hand-edit that line. The Makefile must not hardcode the module path either: it derives it from `go list -m` at make time, so `gonew` needs no Makefile follow-up.
+
 Every config, logging, database, and filesystem default in the project reads from these values:
 
 - the config file base name comes from `ConfigName`,

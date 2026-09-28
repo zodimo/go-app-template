@@ -1,5 +1,6 @@
 .env
 *.log
+/bin
 /.go-cli
 /go-cli-config.json
 /go-app-template.code-workspace
