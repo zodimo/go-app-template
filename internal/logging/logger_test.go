@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/zodimo/go-app-template/internal/core"
+	"github.com/zodimo/go-app-template/internal/identity"
 	"github.com/zodimo/go-maybe"
 )
 
@@ -14,7 +15,7 @@ import (
 // an import cycle).
 type loggerTestContext struct{}
 
-func (loggerTestContext) GetEnvPrefix() string                      { return "GOCLI_LOG" }
+func (loggerTestContext) GetEnvPrefix() string                      { return identity.EnvPrefix + "_LOG" }
 func (loggerTestContext) GetPrefix() string                         { return "log" }
 func (c loggerTestContext) WithEnvPrefix(string) core.ConfigContext { return c }
 func (c loggerTestContext) WithPrefix(string) core.ConfigContext    { return c }

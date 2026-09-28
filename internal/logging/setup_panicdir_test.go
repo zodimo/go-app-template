@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/zodimo/go-app-template/internal/core"
+	"github.com/zodimo/go-app-template/internal/identity"
 	"github.com/zodimo/go-maybe"
 )
 
@@ -11,7 +12,7 @@ import (
 // LogConfig without importing the config package (which would form a cycle).
 type panicDirTestContext struct{}
 
-func (panicDirTestContext) GetEnvPrefix() string                      { return "GOCLI_LOG" }
+func (panicDirTestContext) GetEnvPrefix() string                      { return identity.EnvPrefix + "_LOG" }
 func (panicDirTestContext) GetPrefix() string                         { return "log" }
 func (c panicDirTestContext) WithEnvPrefix(string) core.ConfigContext { return c }
 func (c panicDirTestContext) WithPrefix(string) core.ConfigContext    { return c }

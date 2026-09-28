@@ -75,7 +75,7 @@ func TestLoad_ExplicitConfigWinsOverDiscovered(t *testing.T) {
 func TestConfigPrint_NoConfigFileUsed(t *testing.T) {
 	viper.Reset() // ensure ConfigFileUsed() == ""
 	data := Data{Directory: maybe.Some("/tmp/data")}
-	data.WithConfigContext(NewAppConfigContext("data", "GOCLI_DATA"))
+	data.WithConfigContext(NewAppConfigContext("data", identity.EnvPrefix+"_DATA"))
 	cfg := &Config{
 		WorkingDir: "/tmp",
 		Data:       data,

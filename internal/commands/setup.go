@@ -152,6 +152,7 @@ type change struct {
 	New           string // rewrite literal to substitute
 	Desc          string // human-readable description for --dry-run
 	SkipIfMissing bool   // rewrite: skip (no error) when the file or literal is absent
+	ExpectUnique  bool   // rewrite: error unless the literal occurs exactly once
 }
 
 // plan is the ordered set of changes.
@@ -327,6 +328,7 @@ func buildPlan(root string, cur, next identityVals) (plan, error) {
 			Old: "BIN_TRIO ?= " + cur.BinTrio, New: "BIN_TRIO ?= " + next.BinTrio,
 			Desc:          fmt.Sprintf("rewrite BIN_TRIO in %s", nextPaths.Makefile),
 			SkipIfMissing: true,
+			ExpectUnique:  true,
 		})
 	}
 
@@ -379,12 +381,13 @@ func apply(p plan, dryRun bool) error {
 					continue
 				}
 			}
-			if err := rewriteLiteral(c.Path, c.Old, c.New); err != nil {
+			if err := rewriteLiteral(c.Path, c.Old, c.New, c.ExpectUnique); err != nil {
 				return fmt.Errorf("rewrite %s: %w", c.Path, err)
 			}
 		default:
 			return fmt.Errorf("unknown change kind %q", c.Kind)
 		}
+		fmt.Fprintln(os.Stderr, "applied: "+c.Desc)
 	}
 
 	if !dryRun {
@@ -395,17 +398,22 @@ func apply(p plan, dryRun bool) error {
 
 // rewriteLiteral performs a single deterministic in-place replacement of old
 // with new in path, failing if old is not present (so partial/unknown states
-// are not silently ignored).
-func rewriteLiteral(path, old, new string) error {
+// are not silently ignored). When expectUnique is true it also fails unless old
+// occurs exactly once, guarding against a blanket rewrite of an ambiguous
+// literal.
+func rewriteLiteral(path, old, new string, expectUnique bool) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	if !strings.Contains(string(data), old) {
+	n := strings.Count(string(data), old)
+	if n == 0 {
 		return fmt.Errorf("literal %q not found in %s", old, path)
 	}
-	replaced := strings.Replace(string(data), old, new, 1)
-	return os.WriteFile(path, []byte(replaced), 0o644)
+	if expectUnique && n != 1 {
+		return fmt.Errorf("literal %q occurs %d times in %s (want exactly 1)", old, n, path)
+	}
+	return os.WriteFile(path, []byte(strings.Replace(string(data), old, new, 1)), 0o644)
 }
 
 // prompt reads one trimmed line from r, falling back to def on an empty line or

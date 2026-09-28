@@ -22,7 +22,7 @@ The template's clone flow is `gonew` (rewrites `go.mod` and `.go` imports) follo
 
 ## Impact
 
-- **Code**: `Makefile` (module path dynamic, single `BIN_TRIO`, bug fixes), `internal/commands/setup.go` (new change target + Makefile path in `identityPaths`/change plan), `internal/commands/setup_test.go` (assert Makefile rewrite and idempotency).
+- **Code**: `Makefile` (module path dynamic, single `BIN_TRIO`, bug fixes), `.gitignore` (ignore `/bin`, the Makefile build output directory), `internal/commands/setup.go` (new change target + Makefile path in `identityPaths`/change plan), `internal/commands/setup_test.go` (assert Makefile rewrite and idempotency).
 - **Docs**: `README.md` (clone flow), `CONTRIBUTING.md` (identity single-source contract note).
 - **Specs**: delta specs for `project-scaffolding` and `template-hygiene`.
 - **Dependencies**: none added. `go list -m` is the Go toolchain.

@@ -96,7 +96,7 @@ Surfaced during review, fixed in the same change because they touch the same lin
 
 This is a repo-internal change with no runtime consumers of the Makefile, and the Makefile is not yet committed (staged only), so there is no external migration.
 
-1. Rewrite `Makefile`: add `MODULE`, add `BIN_TRIO`/derived vars, route `./cmd/...` through the vars, apply the four defect fixes.
+1. Rewrite `Makefile`: add `MODULE`, add `BIN_TRIO`/derived vars, route `./cmd/...` through the vars, apply the four defect fixes; add `/bin` to `.gitignore` so the Makefile build output directory stays untracked.
 2. Extend `internal/commands/setup.go`: add the Makefile path and the single rewrite target; skip when absent.
 3. Extend `internal/commands/setup_test.go`: assert the Makefile rewrite, `--dry-run` reporting, and idempotency.
 4. Update `README.md` / `CONTRIBUTING.md` clone-flow wording.

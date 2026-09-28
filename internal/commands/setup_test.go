@@ -210,6 +210,15 @@ func TestBuildPlan_RenamesAndRewritesConsistently(t *testing.T) {
 	if !makefileRewrite.SkipIfMissing {
 		t.Error("Makefile rewrite must set SkipIfMissing")
 	}
+
+	if !makefileRewrite.ExpectUnique {
+		t.Error("Makefile rewrite must set ExpectUnique")
+	}
+	for _, c := range rewrites {
+		if c.Path != filepath.Join(root, "Makefile") && c.ExpectUnique {
+			t.Errorf("only the Makefile rewrite may set ExpectUnique, got %+v", c)
+		}
+	}
 }
 
 func TestBuildPlan_Idempotent(t *testing.T) {
@@ -608,5 +617,98 @@ func TestApply_SkipsMakefileWithMissingAnchor(t *testing.T) {
 	}
 	if string(b) != "BINARY = cli\n" {
 		t.Errorf("anchorless Makefile was mutated: %q", b)
+	}
+}
+
+// TestRewriteLiteral_ExpectUnique covers the strict Makefile guard: a literal
+// that occurs more than once is rejected rather than blanket-rewritten, while a
+// single occurrence is replaced in place.
+func TestRewriteLiteral_ExpectUnique(t *testing.T) {
+	cases := []struct {
+		name         string
+		content      string
+		expectUnique bool
+		wantErr      bool
+		want         string
+	}{
+		{
+			name:         "duplicate literal rejected",
+			content:      "BIN_TRIO ?= cli\nBIN_TRIO ?= cli\n",
+			expectUnique: true,
+			wantErr:      true,
+		},
+		{
+			name:         "single occurrence replaced",
+			content:      "BIN_TRIO ?= cli\n",
+			expectUnique: true,
+			want:         "BIN_TRIO ?= myapp\n",
+		},
+		{
+			name:         "many occurrences allowed when not unique",
+			content:      "cli cli\n",
+			expectUnique: false,
+			want:         "myapp cli\n",
+		},
+		{
+			name:         "missing literal rejected",
+			content:      "nothing here\n",
+			expectUnique: false,
+			wantErr:      true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "Makefile")
+			if err := os.WriteFile(path, []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			err := rewriteLiteral(path, "cli", "myapp", tc.expectUnique)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("rewriteLiteral(expectUnique=%v) on %q: expected error, got nil", tc.expectUnique, tc.content)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("rewriteLiteral: %v", err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("rewriteLiteral wrote %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestApply_ReportsAppliedChanges verifies the non-dry-run branch announces
+// each applied change on stderr as "applied: <Desc>", mirroring the dry-run
+// "would: <Desc>" line, including the Makefile BIN_TRIO rewrite.
+func TestApply_ReportsAppliedChanges(t *testing.T) {
+	root := buildFixtureSkeleton(t)
+	writeFixtureFile(t, root, "Makefile", fixtureMakefile)
+
+	cur := defaultIdentity()
+	next := newIdentityVals("myapp", "myapp", ".myapp", "myapp")
+	p := mustPlan(t, root, cur, next)
+
+	out := captureStderr(t, func() {
+		if err := apply(p, false); err != nil {
+			t.Fatalf("apply failed: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "applied:") {
+		t.Errorf("apply did not report applied changes; stderr:\n%s", out)
+	}
+	if !strings.Contains(out, "BIN_TRIO") {
+		t.Errorf("apply did not report the Makefile rewrite; stderr:\n%s", out)
+	}
+	if strings.Contains(out, "would:") {
+		t.Errorf("non-dry-run apply printed a would: line; stderr:\n%s", out)
 	}
 }
