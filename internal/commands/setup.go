@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go/format"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -16,10 +17,12 @@ import (
 )
 
 // setupCmd re-identifies a cloned project. It prompts for an application name,
-// environment prefix, data directory, and binary-trio prefix, then rewrites the
-// identity-derived artifacts of the tree: internal/identity/identity.go, the three
-// cmd/ entrypoint directories, the cobra Use strings, the panic-recovery tags,
-// and the identity lines in .gitignore.
+// environment prefix, data directory, binary-trio prefix, and whether to remove
+// the template's agent/IDE scaffolding, then rewrites the identity-derived
+// artifacts of the tree: internal/identity/identity.go, the three cmd/ entrypoint
+// directories, the cobra Use strings, the panic-recovery tags, the Makefile
+// BIN_TRIO line, and the identity lines in .gitignore. When consented, it also
+// removes .opencode/, openspec/, *.code-workspace, AGENTS.md, and CLAUDE.md.
 //
 // The command is idempotent: re-running with the same values is a no-op, and
 // re-running with new values re-identifies the tree consistently (because the
@@ -31,9 +34,13 @@ var setupCmd = &cobra.Command{
 
 Prompts for an application name, environment prefix, data directory, and
 binary-trio prefix, then regenerates internal/identity/identity.go, renames the
-command entrypoint directories, and rewrites cobra Use strings, panic tags, and
-.gitignore entries to match. All inputs are validated before any mutation, and
-the operation is idempotent.`,
+command entrypoint directories, and rewrites cobra Use strings, panic tags, the
+Makefile BIN_TRIO line, and .gitignore entries to match. It then offers,
+defaulting to Yes, to remove the template's agent/IDE scaffolding
+(.opencode/, openspec/, *.code-workspace, AGENTS.md, CLAUDE.md); removals run
+after the identity rewrites and are skipped when the path is already absent or
+when openspec/ appears to be the authoring repository. All inputs are validated
+before any mutation, and the operation is idempotent.`,
 	RunE: runSetup,
 }
 
@@ -128,13 +135,14 @@ func validateIdentity(v identityVals) error {
 	return nil
 }
 
-// changeKind enumerates the three mutation shapes.
+// changeKind enumerates the mutation shapes.
 type changeKind string
 
 const (
 	kindRename  changeKind = "rename"
 	kindWrite   changeKind = "write"
 	kindRewrite changeKind = "rewrite"
+	kindRemove  changeKind = "remove"
 )
 
 // change is a single planned mutation.
@@ -142,6 +150,7 @@ const (
 //   - rename:  From -> To (directory rename)
 //   - write:   Path <- Content (full-file regeneration: identity.go, .gitignore)
 //   - rewrite: Path: replace the literal Old with New (Use lines, panic tags)
+//   - remove:  Path: delete the file or directory at Path (agent scaffolding)
 type change struct {
 	Kind          changeKind
 	From          string // rename source
@@ -151,8 +160,9 @@ type change struct {
 	Old           string // rewrite literal to find
 	New           string // rewrite literal to substitute
 	Desc          string // human-readable description for --dry-run
-	SkipIfMissing bool   // rewrite: skip (no error) when the file or literal is absent
+	SkipIfMissing bool   // rewrite/remove: skip (no error) when the file/dir is absent
 	ExpectUnique  bool   // rewrite: error unless the literal occurs exactly once
+	Skip          bool   // remove: never execute (guarded); reported but left in place
 }
 
 // plan is the ordered set of changes.
@@ -197,6 +207,70 @@ func findPaths(root string, v identityVals) identityPaths {
 	}
 }
 
+// agentArtifactSet is the fixed, root-relative list of agent/IDE scaffolding that
+// belongs to the template repository, not to a downstream project. It is returned
+// as literal paths (directories and files); `*.code-workspace` is the one glob and
+// is expanded separately so a repo with no workspace file yields no entry.
+var agentArtifactSet = []string{
+	".opencode",
+	"openspec",
+	"AGENTS.md",
+	"CLAUDE.md",
+}
+
+// agentArtifactPaths resolves the scaffolding removal set for root: the fixed
+// literal paths plus every `*.code-workspace` match, returned workspace-rooted.
+// It does not stat the paths; existence is checked when the plan is built so the
+// list stays a pure function of root.
+func agentArtifactPaths(root string) []string {
+	paths := make([]string, 0, len(agentArtifactSet)+1)
+	for _, rel := range agentArtifactSet {
+		paths = append(paths, filepath.Join(root, rel))
+	}
+	if matches, err := filepath.Glob(filepath.Join(root, "*.code-workspace")); err == nil {
+		paths = append(paths, matches...)
+	}
+	return paths
+}
+
+// openspecDir is the single agent artifact whose removal could destroy the
+// authoring repository's own change history, so it is guarded separately.
+func openspecDir(root string) string { return filepath.Join(root, "openspec") }
+
+// shouldSkipOpenspec reports whether the openspec/ directory looks like the
+// authoring repository (i.e. holds uncommitted tracked changes) and must not be
+// removed. It shells out to git; when git is unavailable or the workspace is not
+// a repository it returns false (skip nothing), leaving removal gated solely by
+// the operator's consent.
+func shouldSkipOpenspec(root string) bool {
+	cmd := osexec.Command("git", "status", "--porcelain", "--", "openspec")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return len(strings.TrimSpace(string(out))) > 0
+}
+
+// resolveRemovals turns the operator's consent into the concrete list of
+// removals to plan: only paths that currently exist are included (so a re-run
+// over an already-clean tree plans nothing), and the guarded openspec/ target
+// is marked Skip rather than dropped so it still surfaces in --dry-run. It
+// performs the filesystem and git I/O so buildPlan can stay pure.
+func resolveRemovals(root string, consent bool) []removal {
+	if !consent {
+		return nil
+	}
+	var removals []removal
+	for _, p := range agentArtifactPaths(root) {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		removals = append(removals, removal{Path: p, Skip: p == openspecDir(root) && shouldSkipOpenspec(root)})
+	}
+	return removals
+}
+
 // buildIdentityContent renders the regenerated identity.go source for v,
 // preserving the exact "GENERATED by `setup`" comment block and all five vars.
 // The output is run through go/format so it is always gofmt-clean regardless of
@@ -236,12 +310,32 @@ func gitignoreContent(v identityVals) []byte {
 	return []byte(b.String())
 }
 
+// removal is a single agent/IDE scaffolding target considered for deletion. A
+// target is resolved (and guarded) before buildPlan runs so the plan function
+// itself stays pure.
+//
+//   - Path:  workspace-rooted path to remove
+//   - Skip:  true when a guard forbids removing this target (e.g. openspec/ in
+//     the authoring repo); a skipped target is still listed in --dry-run but is
+//     never executed, so the operator can see what was deliberately left alone.
+type removal struct {
+	Path string
+	Skip bool
+}
+
 // buildPlan computes the full, ordered set of changes to move from the current
 // identity cur to the next identity next, rooted at root. It is a pure function
 // (no I/O) and is idempotent by construction: anything already matching the
 // target is skipped, so a same-value plan is empty and a new-value plan always
 // derives targets from the live cur.
-func buildPlan(root string, cur, next identityVals) (plan, error) {
+// buildPlan computes the full, ordered set of changes to move from the current
+// identity cur to the next identity next, rooted at root, and to remove the
+// given agent/IDE scaffolding removals. It is a pure function (no I/O) and is
+// idempotent by construction: anything already matching the target is skipped,
+// so a same-value plan is empty and a new-value plan always derives targets
+// from the live cur. Removals are appended last so a failure during
+// re-identification never leaves the tree half-wiped.
+func buildPlan(root string, cur, next identityVals, removals []removal) (plan, error) {
 	var p plan
 
 	curPaths := findPaths(root, cur)
@@ -343,6 +437,23 @@ func buildPlan(root string, cur, next identityVals) (plan, error) {
 		})
 	}
 
+	// 6. Remove agent/IDE scaffolding, after every identity rewrite, so a
+	// failure above cannot half-wipe the tree. Absent paths are a no-op at
+	// apply time (SkipIfMissing); a guarded target is never executed.
+	for _, r := range removals {
+		desc := fmt.Sprintf("remove %s", r.Path)
+		if r.Skip {
+			desc = fmt.Sprintf("skip removing %s (appears to be the authoring repo)", r.Path)
+		}
+		p.Changes = append(p.Changes, change{
+			Kind:          kindRemove,
+			Path:          r.Path,
+			Desc:          desc,
+			SkipIfMissing: true,
+			Skip:          r.Skip,
+		})
+	}
+
 	return p, nil
 }
 
@@ -383,6 +494,19 @@ func apply(p plan, dryRun bool) error {
 			}
 			if err := rewriteLiteral(c.Path, c.Old, c.New, c.ExpectUnique); err != nil {
 				return fmt.Errorf("rewrite %s: %w", c.Path, err)
+			}
+		case kindRemove:
+			if c.Skip {
+				fmt.Fprintln(os.Stderr, "guarded: "+c.Desc)
+				continue
+			}
+			if c.SkipIfMissing {
+				if _, err := os.Stat(c.Path); errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+			}
+			if err := os.RemoveAll(c.Path); err != nil {
+				return fmt.Errorf("remove %s: %w", c.Path, err)
 			}
 		default:
 			return fmt.Errorf("unknown change kind %q", c.Kind)
@@ -430,6 +554,33 @@ func prompt(r *bufio.Scanner, label, def string) string {
 	return line
 }
 
+// promptYesNo is the boolean sibling of prompt. It treats an empty line or EOF
+// as the default value, so the wizard stays scriptable (`< /dev/null` accepts
+// the default). Any answer beginning with y/Y is true, n/N is false; anything
+// else falls back to def.
+func promptYesNo(r *bufio.Scanner, label string, def bool) bool {
+	defStr := "Y/n"
+	if !def {
+		defStr = "y/N"
+	}
+	fmt.Fprintf(os.Stderr, "%s [%s]: ", label, defStr)
+	if !r.Scan() {
+		return def
+	}
+	line := strings.ToLower(strings.TrimSpace(r.Text()))
+	if line == "" {
+		return def
+	}
+	switch line[0] {
+	case 'y':
+		return true
+	case 'n':
+		return false
+	default:
+		return def
+	}
+}
+
 // runSetup orchestrates the wizard.
 func runSetup(cmd *cobra.Command, args []string) error {
 	root, err := os.Getwd()
@@ -444,6 +595,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	envPrefix := prompt(scanner, "Env prefix", cur.EnvPrefix)
 	dataDir := prompt(scanner, "Data dir", cur.DataDir)
 	binTrio := prompt(scanner, "Binary trio prefix", cur.BinTrio)
+	removeAgents := promptYesNo(scanner, "Remove agent scaffolding (.opencode/, openspec/, *.code-workspace, AGENTS.md/CLAUDE.md)?", true)
 
 	next := newIdentityVals(appName, envPrefix, dataDir, binTrio)
 
@@ -451,12 +603,14 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if sameValues(cur, next) {
+	removals := resolveRemovals(root, removeAgents)
+
+	if sameValues(cur, next) && len(removals) == 0 {
 		fmt.Fprintln(os.Stderr, "setup: identity already matches the requested values; nothing to do")
 		return nil
 	}
 
-	p, err := buildPlan(root, cur, next)
+	p, err := buildPlan(root, cur, next, removals)
 	if err != nil {
 		return err
 	}

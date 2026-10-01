@@ -1,8 +1,10 @@
 package commands
 
 import (
+	"bufio"
 	"go/format"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,10 +22,12 @@ func defaultIdentity() identityVals {
 }
 
 // mustPlan is a test helper for the (plan, error) buildPlan signature. It fails
-// the test on a formatting error, which the fixture inputs never trigger.
+// the test on a formatting error, which the fixture inputs never trigger. It
+// defaults to no agent-artifact removals; callers that exercise cleanup call
+// buildPlan directly.
 func mustPlan(t *testing.T, root string, cur, next identityVals) plan {
 	t.Helper()
-	p, err := buildPlan(root, cur, next)
+	p, err := buildPlan(root, cur, next, nil)
 	if err != nil {
 		t.Fatalf("buildPlan: %v", err)
 	}
@@ -710,5 +714,315 @@ func TestApply_ReportsAppliedChanges(t *testing.T) {
 	}
 	if strings.Contains(out, "would:") {
 		t.Errorf("non-dry-run apply printed a would: line; stderr:\n%s", out)
+	}
+}
+
+// --- agent-artifact removal (setup-remove-agent-artifacts) ---------------
+
+// scaffoldFixture creates root/.opencode (dir), root/openspec (dir),
+// root/AGENTS.md, root/CLAUDE.md, and root/myapp.code-workspace so the removal
+// set resolves to a known, non-empty list.
+func scaffoldFixture(t *testing.T, root string) []string {
+	t.Helper()
+	for _, d := range []string{".opencode", "openspec"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{"AGENTS.md", "CLAUDE.md", "myapp.code-workspace"} {
+		if err := os.WriteFile(filepath.Join(root, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return []string{
+		filepath.Join(root, ".opencode"),
+		filepath.Join(root, "openspec"),
+		filepath.Join(root, "AGENTS.md"),
+		filepath.Join(root, "CLAUDE.md"),
+		filepath.Join(root, "myapp.code-workspace"),
+	}
+}
+
+// removalsFrom extracts kindRemove changes from a plan, keyed by path.
+func removalsFrom(p plan) map[string]change {
+	m := map[string]change{}
+	for _, c := range p.Changes {
+		if c.Kind == kindRemove {
+			m[c.Path] = c
+		}
+	}
+	return m
+}
+
+// TestBuildPlan_RemovesAgentArtifacts covers 5.1: consent produces one
+// kindRemove per existing scaffold path, each with SkipIfMissing set.
+func TestBuildPlan_RemovesAgentArtifacts(t *testing.T) {
+	root := t.TempDir()
+	want := scaffoldFixture(t, root)
+
+	cur := defaultIdentity()
+	// Same identity so the plan is removals only, in isolation.
+	p, err := buildPlan(root, cur, cur, resolveRemovals(root, true))
+	if err != nil {
+		t.Fatalf("buildPlan: %v", err)
+	}
+	got := removalsFrom(p)
+	if len(got) != len(want) {
+		t.Fatalf("expected %d removals, got %d: %+v", len(want), len(got), got)
+	}
+	for _, w := range want {
+		c, ok := got[w]
+		if !ok {
+			t.Errorf("missing removal for %s", w)
+			continue
+		}
+		if !c.SkipIfMissing {
+			t.Errorf("removal %s must set SkipIfMissing", w)
+		}
+		if c.Skip {
+			t.Errorf("removal %s unexpectedly guarded", w)
+		}
+	}
+}
+
+// TestBuildPlan_NoRemovalsWithoutConsent covers that declining (consent=false)
+// yields no removal changes.
+func TestBuildPlan_NoRemovalsWithoutConsent(t *testing.T) {
+	root := t.TempDir()
+	scaffoldFixture(t, root)
+	cur := defaultIdentity()
+	p := mustPlan(t, root, cur, cur)
+	if len(removalsFrom(p)) != 0 {
+		t.Fatalf("expected no removals without consent, got %+v", p.Changes)
+	}
+}
+
+// TestBuildPlan_RemovalsAreLast covers 5.2: removal changes come after every
+// identity change (rename/write/rewrite).
+func TestBuildPlan_RemovalsAreLast(t *testing.T) {
+	root := t.TempDir()
+	scaffoldFixture(t, root)
+	cur := defaultIdentity()
+	next := newIdentityVals("myapp", "myapp", ".myapp", "myapp")
+	p, err := buildPlan(root, cur, next, resolveRemovals(root, true))
+	if err != nil {
+		t.Fatalf("buildPlan: %v", err)
+	}
+	seenRemoval := false
+	for _, c := range p.Changes {
+		if c.Kind == kindRemove {
+			seenRemoval = true
+			continue
+		}
+		if seenRemoval {
+			t.Fatalf("non-removal change %+v appeared after a removal", c)
+		}
+	}
+	if !seenRemoval {
+		t.Fatal("expected removal changes")
+	}
+}
+
+// TestApply_RemovesConsentedArtifacts covers the happy path: consented
+// artifacts are deleted and reported.
+func TestApply_RemovesConsentedArtifacts(t *testing.T) {
+	root := t.TempDir()
+	want := scaffoldFixture(t, root)
+	cur := defaultIdentity()
+	p, err := buildPlan(root, cur, cur, resolveRemovals(root, true))
+	if err != nil {
+		t.Fatalf("buildPlan: %v", err)
+	}
+	out := captureStderr(t, func() {
+		if err := apply(p, false); err != nil {
+			t.Fatalf("apply failed: %v", err)
+		}
+	})
+	for _, w := range want {
+		if _, err := os.Stat(w); !os.IsNotExist(err) {
+			t.Errorf("expected %s removed, stat err=%v", w, err)
+		}
+	}
+	if !strings.Contains(out, "remove") {
+		t.Errorf("apply did not report removals; stderr:\n%s", out)
+	}
+}
+
+// TestApply_DryRunRemovalsMutateNothing covers 5.3: --dry-run reports removals
+// but deletes nothing.
+func TestApply_DryRunRemovalsMutateNothing(t *testing.T) {
+	root := t.TempDir()
+	want := scaffoldFixture(t, root)
+	cur := defaultIdentity()
+	p, err := buildPlan(root, cur, cur, resolveRemovals(root, true))
+	if err != nil {
+		t.Fatalf("buildPlan: %v", err)
+	}
+	out := captureStderr(t, func() {
+		if err := apply(p, true); err != nil {
+			t.Fatalf("dry-run apply failed: %v", err)
+		}
+	})
+	for _, w := range want {
+		if _, err := os.Stat(w); err != nil {
+			t.Errorf("dry-run removed %s (stat err=%v)", w, err)
+		}
+	}
+	if !strings.Contains(out, "would:") || !strings.Contains(out, "remove") {
+		t.Errorf("dry-run did not report removals; stderr:\n%s", out)
+	}
+}
+
+// TestApply_RemovalsIdempotent covers 5.4 and 5.5: a second plan over an
+// already-cleaned tree is empty, and second apply is a no-op.
+func TestApply_RemovalsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	scaffoldFixture(t, root)
+	cur := defaultIdentity()
+
+	p, _ := buildPlan(root, cur, cur, resolveRemovals(root, true))
+	if err := apply(p, false); err != nil {
+		t.Fatalf("first apply failed: %v", err)
+	}
+
+	// Nothing left to remove -> empty plan.
+	p2, _ := buildPlan(root, cur, cur, resolveRemovals(root, true))
+	if !p2.empty() {
+		t.Fatalf("expected empty plan after cleanup, got %+v", p2.Changes)
+	}
+	// A plan built before removal, re-applied, must not error (SkipIfMissing).
+	if err := apply(p, false); err != nil {
+		t.Fatalf("re-apply over removed paths failed: %v", err)
+	}
+}
+
+// TestResolveRemovals_SkipsAbsent covers 5.5: absent scaffold paths are not
+// planned, so a clean tree resolves to an empty removal list.
+func TestResolveRemovals_SkipsAbsent(t *testing.T) {
+	root := t.TempDir()
+	if got := resolveRemovals(root, true); len(got) != 0 {
+		t.Fatalf("expected no removals in a clean tree, got %+v", got)
+	}
+}
+
+// TestPromptYesNo_Defaults covers 5.6 and 5.7: empty line and EOF accept the
+// default; explicit y/n override it.
+func TestPromptYesNo_Defaults(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		def  bool
+		want bool
+	}{
+		{"empty accepts default true", "\n", true, true},
+		{"empty accepts default false", "\n", false, false},
+		{"eof accepts default true", "", true, true},
+		{"explicit y", "y\n", false, true},
+		{"explicit n", "n\n", true, false},
+		{"explicit yes", "yes\n", false, true},
+		{"explicit no", "no\n", true, false},
+		{"garbage falls back to default", "maybe\n", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scanner := bufio.NewScanner(strings.NewReader(tc.in))
+			got := captureStderr(t, func() {
+				if v := promptYesNo(scanner, "q", tc.def); v != tc.want {
+					t.Fatalf("promptYesNo(%q, def=%v) = %v, want %v", tc.in, tc.def, v, tc.want)
+				}
+			})
+			_ = got
+		})
+	}
+}
+
+// TestResolveRemovals_GuardOpenspec covers 5.8: when openspec/ is dirty in a
+// git repo, its removal is planned but marked Skip.
+func TestResolveRemovals_GuardOpenspec(t *testing.T) {
+	if _, err := osexec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	scaffoldFixture(t, root)
+
+	run := func(args ...string) {
+		cmd := osexec.Command("git", args...)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	// openspec/ needs a tracked file so the repo has a commit; git does not
+	// track empty directories.
+	if err := os.WriteFile(filepath.Join(root, "openspec", "spec.md"), []byte("s"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "openspec/spec.md")
+	run("commit", "-m", "seed")
+	// Dirty openspec/ by modifying the tracked file (uncommitted tracked change).
+	if err := os.WriteFile(filepath.Join(root, "openspec", "spec.md"), []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := resolveRemovals(root, true)
+	var openspec *removal
+	for i := range got {
+		if got[i].Path == openspecDir(root) {
+			openspec = &got[i]
+		}
+	}
+	if openspec == nil {
+		t.Fatal("expected openspec/ in the removal set")
+	}
+	if !openspec.Skip {
+		t.Error("expected openspec/ removal to be guarded (Skip=true) in a dirty repo")
+	}
+}
+
+// TestApply_GuardedRemovalIsSkipped verifies a Skip removal is reported but
+// never executed.
+func TestApply_GuardedRemovalIsSkipped(t *testing.T) {
+	root := t.TempDir()
+	scaffoldFixture(t, root)
+	guarded := filepath.Join(root, "openspec")
+	p := plan{Changes: []change{{
+		Kind:          kindRemove,
+		Path:          guarded,
+		Desc:          "skip removing " + guarded,
+		SkipIfMissing: true,
+		Skip:          true,
+	}}}
+	out := captureStderr(t, func() {
+		if err := apply(p, false); err != nil {
+			t.Fatalf("apply failed: %v", err)
+		}
+	})
+	if _, err := os.Stat(guarded); err != nil {
+		t.Errorf("guarded path was removed: %v", err)
+	}
+	if !strings.Contains(out, "guarded:") {
+		t.Errorf("expected a guarded report; stderr:\n%s", out)
+	}
+}
+
+// TestAgentArtifactPaths_IncludesGlob verifies the *.code-workspace glob is
+// expanded against the workspace root.
+func TestAgentArtifactPaths_IncludesGlob(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureFile(t, root, "foo.code-workspace", "x")
+	writeFixtureFile(t, root, "bar.code-workspace", "x")
+	paths := agentArtifactPaths(root)
+	want := map[string]bool{
+		filepath.Join(root, "foo.code-workspace"): true,
+		filepath.Join(root, "bar.code-workspace"): true,
+	}
+	for _, p := range paths {
+		delete(want, p)
+	}
+	if len(want) != 0 {
+		t.Errorf("agentArtifactPaths missing glob matches: %+v", want)
 	}
 }

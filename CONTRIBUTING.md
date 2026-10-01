@@ -27,7 +27,9 @@ The `setup` command is an interactive cobra wizard that completes the clone. It 
 - renames `cmd/cli` → `cmd/myapp`, `cmd/cli-config` → `cmd/myapp-config`, `cmd/cli-migration` → `cmd/myapp-migration`,
 - rewrites the cobra `use:` strings, panic tags, and related identity-dependent files.
 
-It is idempotent: running it again with the same values makes no changes, and running it with new values re-identifies consistently.
+It then offers, **defaulting to Yes**, to remove the template's agent/IDE scaffolding from the clone: `.opencode/`, `openspec/`, any `*.code-workspace` file, `AGENTS.md`, and `CLAUDE.md`. The removals run after the identity rewrites, are skipped for paths that are already absent, and leave `openspec/` in place when it looks like the authoring repository (uncommitted tracked changes). `setup --dry-run` prints the plan, including the removals, without deleting anything.
+
+It is idempotent: running it again with the same values makes no changes, and running it with new values re-identifies consistently. Note that `gonew` (Layer 1) copies only `.go` files and `go.mod`, and `.opencode/` is git-ignored and untracked, so a `gonew`-created project usually has none of this scaffolding — the cleanup step is defensive and does real work only when the project was seeded another way.
 
 **Then build and generate your config:**
 
