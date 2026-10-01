@@ -17,7 +17,8 @@ BUILD_DIR=bin
 
 
 # Version information from git
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "0.1.0")
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "v0.1.0")
+# Version stripped from the leading v
 CLEAN_VERSION = $(patsubst v%,%,$(VERSION))
 COMMIT_ID ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE ?= $(shell date +%FT%T%z)
@@ -36,6 +37,7 @@ NEXT_MINOR_VERSION := $(MAJOR).$(NEW_MINOR).0
 NEXT_MAJOR_VERSION := $(NEW_MAJOR).0.0
 # Allow pre-release and build metadata in version validation
 VERSION_VALID := $(shell echo $(CURRENT_VERSION) | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9\.-]+)?(\+[A-Za-z0-9\.-]+)?$$' >/dev/null && echo "true" || echo "false")
+# has uncommitted files
 IS_DIRTY := $(shell git diff-index --quiet HEAD -- || echo "true")
 
 
