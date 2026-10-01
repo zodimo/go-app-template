@@ -324,11 +324,6 @@ type removal struct {
 }
 
 // buildPlan computes the full, ordered set of changes to move from the current
-// identity cur to the next identity next, rooted at root. It is a pure function
-// (no I/O) and is idempotent by construction: anything already matching the
-// target is skipped, so a same-value plan is empty and a new-value plan always
-// derives targets from the live cur.
-// buildPlan computes the full, ordered set of changes to move from the current
 // identity cur to the next identity next, rooted at root, and to remove the
 // given agent/IDE scaffolding removals. It is a pure function (no I/O) and is
 // idempotent by construction: anything already matching the target is skipped,
